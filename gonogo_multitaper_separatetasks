@@ -1,0 +1,968 @@
+#################################################################################################################################################
+# A script to run multitaper analysis on VS electrodes from the GoNogo task
+#
+#
+#
+# Karim Mithani
+# Jan 2024
+#################################################################################################################################################
+
+import os
+import numpy as np
+import pandas as pd
+
+# DSP libraries
+import mne
+from scipy.signal import butter, sosfiltfilt, hilbert
+
+# Stats libraries
+from scipy import stats
+from scipy import ndimage
+from scipy.integrate import simpson
+from pymer4.models import Lmer
+
+# Plotting libraries
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Miscellaneous libraries
+import h5py
+from math import floor, ceil, sqrt
+import pickle
+from tqdm import tqdm
+from scipy.ndimage import binary_erosion
+
+# User-defined variables
+# User-defined variables
+processed_dir = '/d/gmi/1/karimmithani/seeg/processed' # Where processed data will be stored
+Fs = 2048 # Sampling frequency
+montage = 'bipolar' # Montage to use (either 'bipolar' or 'referential')
+analysis_dir = '/d/gmi/1/karimmithani/seeg/analysis/gonogo/multitaper_analysis/analysis' # Where analysis will be stored
+cache_dir = os.path.join(analysis_dir, 'cache') # Where to store cached data
+figpath = '/d/gmi/1/karimmithani/seeg/analysis/gonogo/multitaper_analysis/figures' # Where to save figures
+interested_events = ['Nogo Correct', 'Nogo Incorrect'] # Events of interest; the script will subtract PSDs of the second event from the first event
+baseline_method = 'decibel' # Method to use for baseline correction. Options are 'decibel', 'percentchange', or 'zscore'
+baseline_period = [0, 0.5] # Baseline period to use for baseline correction
+
+rerun_multitaper_analysis = False # Whether to rerun multitaper analysis
+
+# Specify subjects being analyzed and corresponding file names
+subjects = {
+    'SEEG-SK-53': {'day3': ['GoNogo']},
+    'SEEG-SK-54': {'day1': ['GoNogo'],
+                   'day2': ['GoNogo_py'],
+                   'day7': ['GoNogo_py']},
+    'SEEG-SK-55': {'day2': ['GoNogo_py'],
+                   'day3': ['GoNogo_py']},
+    'SEEG-SK-62': {'day1': ['GoNogo_py'],
+                   'day2': ['GoNogo_py']},
+    'SEEG-SK-63': {'day1': ['GoNogo_py'],
+                   'day2': ['GoNogo_py']}
+}
+
+vs_channel_labels = {'SEEG-SK-53': 'LLVS1-LLVS2',
+                     'SEEG-SK-54': 'FVT1-FVT2',
+                     'SEEG-SK-55': 'STR1-STR2',
+                     'SEEG-SK-62': 'VS1-VS2',
+                     'SEEG-SK-63': 'VS1-VS2'} # Dictionary of subject IDs and corresponding VS channel labels
+
+other_channels = {'SEEG-SK-53': ['MLAI1-MLAI2', 'MHMI1-MHMI2', 'POSI1-POSI2', 'PTAC1-PTAC2', 'ILAC1-ILAC2', 'FOFC1-FOFC2'],
+                  'SEEG-SK-54': ['SMI1-SMI2', 'AM1-AM2', 'HP1-HP2', 'PTC1-PTC2', 'POC1-POC2', 'FMAI1-FMAI2', 'HMC1-HMC2', 'STT1-STT2'],
+                  'SEEG-SK-55': ['AM1-AM2', 'HP1-HP2', 'AI1-AI2', 'MI1-MI2', 'PI1-PI2', 'AC1-AC2', 'MC1-MC2', 'PC1-PC2', 'PREC1-PREC2', 'PT1-PT2'],
+                  'SEEG-SK-62': ['AM1-AM2', 'HP1-HP2', 'AI1-AI2', 'MI1-MI2', 'PI1-PI2', 'CMN1-CMN2'],
+                  'SEEG-SK-63': ['AI1-AI2', 'MI1-MI2', 'PI1-PI2', 'AC1-AC2', 'PST6-PST7', 'OF1-OF2', 'ANT1-ANT2', 'HP1-HP2', 'AM1-AM2']} 
+
+if montage != 'bipolar':
+    # Reconfigure channels to referential format
+    vs_channel_labels = {subj: x.split('-')[0] for subj, x in vs_channel_labels.items()} # Dictionary of subject IDs and corresponding VS channel labels
+
+# Create directories if they don't exist
+if not os.path.exists(figpath):
+    os.makedirs(figpath)
+if not os.path.exists(analysis_dir):
+    os.makedirs(analysis_dir)
+if not os.path.exists(cache_dir):
+    os.makedirs(cache_dir)
+    
+# Miscellaneous plotting variables
+plt.rcParams['font.family'] = 'FreeSans'
+custom_palette = sns.color_palette('Set1', n_colors=3)
+custom_palette = [custom_palette[1], custom_palette[0]]
+
+
+#################################################################################################################################################
+# Functions
+#################################################################################################################################################
+
+# Multitaper PSD estimation
+def multitaper_analysis(X, Fs, n_freqs, min_freq, max_freq, n_jobs):
+    '''
+    Performs a multitaper analysis on the input data (X) at a 
+    specified sampling rate (Fs), using user-specified frequencies
+    (n_freqs) in between user-specified specified minimum (min_freq) and maximum
+    (max_freq) frequences, and number of cycles (n_cycles).
+    '''
+    
+    freqs = np.linspace(min_freq, max_freq, n_freqs)
+    
+    n_timepoints = X.shape[2]
+    n_trials = X.shape[0]
+    n_channels = X.shape[1]
+    n_cycles = freqs / 2
+    time_bandwidth = 4
+    
+    power_trials = np.zeros((n_trials, n_channels, len(freqs), n_timepoints))
+    
+    for trialidx, trial in enumerate(X):
+        trial = trial.reshape(1, n_channels, n_timepoints)
+        power = mne.time_frequency.tfr_array_multitaper(trial, sfreq=Fs, freqs=freqs, n_cycles=n_cycles, time_bandwidth=time_bandwidth, output='avg_power', n_jobs=n_jobs, verbose=False)
+        power_trials[trialidx,:,:,:] = power
+        
+    # Now let's calculate the average power across all trials in each channel:
+    # avg_power = np.mean(power_trials, axis=0)
+    # And then scale it logarithmically:
+    # avg_power = np.log10(avg_power)
+    
+    # # Create a big subplot with average power across all channels as a separate subplot:
+    # nrows = floor(sqrt(n_channels))
+    # ncols = ceil(sqrt(n_channels))
+    # fig, ax = plt.subplots(nrows=nrows, ncols=ncols, figsize=(20,20))
+    # for ch in range(n_channels):
+    #     ax[ch//ncols, ch%ncols].imshow(avg_power[ch], cmap='hot', aspect='auto', origin='lower')
+    #     ax[ch//ncols, ch%ncols].set_title('Channel ' + str(ch+1))
+    # fig.tight_layout
+        
+    # ax.imshow(avg_power, cmap='jet', aspect='auto', origin='lower')
+    # ax.set_title('Average power across all trials')
+    
+    # Return both the average power across all trials, and the power for each trial:
+    return power_trials
+
+# Baseline correction
+def custom_baseline(data, baseline_period, method, Fs=Fs):
+    '''
+    A function to baseline data using a custom baseline period
+    Inputs:
+        data: a numpy array of shape (n_channels, n_ferquencies, n_times) containing time-frequency power estimates
+        baseline: a list of length 2 containing the start and end of the baseline period
+        method: a string specifying the method to use for baseline correction. Options are 'decibel', 'percentchange', or 'zscore'
+        Fs: sampling frequency
+    Outputs:
+        corrected_data: a numpy array of shape (n_channels, n_ferquencies, n_times) containing baseline-corrected time-frequency power estimates
+    '''
+    
+    # Get baseline power estimate
+    baseline = data[:, :, floor(baseline_period[0]*Fs):ceil(baseline_period[1]*Fs)]
+    n_freqs = baseline.shape[1]
+    corrected_data = np.zeros(data.shape)
+
+    for f in range(n_freqs):
+        baseline_mean = np.mean(baseline[:, f, :], axis=1)
+        baseline_std = np.std(baseline[:, f, :], axis=1)
+        if method == 'decibel':
+            corrected_data[:, f, :] = 10*np.log10(data[:, f, :]/baseline_mean[:, np.newaxis])
+        elif method == 'percentchange':
+            corrected_data[:, f, :] = 100*((data[:, f, :] - baseline_mean[:, np.newaxis]) / baseline_mean[:, np.newaxis])
+        elif method == 'zscore':
+            corrected_data[:, f, :] = (data[:, f, :] - baseline_mean[:, np.newaxis]) / baseline_std[:, np.newaxis]
+        
+    # # Alternate, non-vectorized version
+    # for f in range(n_freqs):
+    #     baseline_mean = np.mean(baseline[:, f, :], axis=1)
+    #     baseline_std = np.std(baseline[:, f, :], axis=1)
+    #     if method == 'decibel':
+    #         # Loop through each frequency and timepoint and convert to decibel
+    #         for t in range(data.shape[2]):
+    #             corrected_data[:, f, t] = 10*np.log10(data[:, f, t]/baseline_mean)
+    #     elif method == 'percentchange':
+    #         # Loop through each frequency and timepoint and convert to percent change
+    #         for t in range(data.shape[2]):
+    #             corrected_data[:, f, t] = 100*((data[:, f, t] - baseline_mean) / baseline_mean)
+    #     elif method == 'zscore':
+    #         # Loop through each frequency and timepoint and convert to z-score
+    #         for t in range(data.shape[2]):
+    #             corrected_data[:, f, t] = (data[:, f, t] - baseline_mean) / baseline_std
+    
+    return corrected_data
+
+
+# UNDER CONSTRUCTION:
+# Baseline PSDs generated using Welch's method
+def welch_baseline(event_psds, freqs, Fs=Fs):
+    '''
+    A function to baseline PSDs estimated using Welch's method
+    Inputs:
+        event_psds: a numpy array of shape (n_channels, n_frequencies, n_psd_estimates) containing PSD estimates
+        baseline_pre_psds: whether to baseline the data before computing PSDs
+        freqs: a numpy array of shape (n_frequencies,) containing the frequencies corresponding to the PSD estimates
+        Fs: sampling frequency
+    Outputs:
+        psds: a numpy array of shape (n_trials, n_channels, n_frequencies) containing PSD estimates for each frequency
+    '''
+    # This method of baselining calculates the relative contribution of power at each frequency to the absolute power across all frequencies,
+    #   on a channel-by-channel basis. Please refer to:
+    #       - https://raphaelvallat.com/bandpower.html
+    #
+    
+    # First, calculate frequency resolution
+    freq_res = freqs[1] - freqs[0]
+    # Establish an array to store the baselined data with the same shape as the input
+    event_psds_baselined = np.zeros(event_psds.shape)
+    # Then, loop through each trial and each frequency value, calculating the relative contribution of each frequency to the total power on a channel-by-channel basis
+    for trial in range(event_psds.shape[0]):
+        for freqidx in range(event_psds.shape[2]):
+            event_psds_baselined[trial][:,freqidx] = (event_psds[trial][:,freqidx] / simpson(y=event_psds[trial], dx=freq_res))*100
+
+    return event_psds_baselined
+
+# Calculate PSDs using Welch's method
+def calc_welch(timeseries, fmin, fmax, Fs=Fs, nperseg=512):
+    '''
+    A function to compute Welch PSDs
+    Inputs:
+        timeseries: a numpy array of shape (n_channels, n_times) containing time-series data
+        Fs: sampling frequency
+        nperseg: number of time points to use for each PSD estimate
+
+    Outputs:
+        psds: a numpy array of shape (n_channels, n_frequencies, n_psd_estimates) containing PSD estimates
+        freqs: a numpy array of shape (n_frequencies,) containing the frequencies corresponding to the PSD estimates
+    '''
+    
+    n_overlap = int(0.5*nperseg)
+    
+    # Compute PSDs
+    psds, freqs = mne.time_frequency.psd_array_welch(timeseries, fmin=fmin, fmax=fmax, sfreq=Fs, n_fft=nperseg, n_per_seg=nperseg, n_overlap=n_overlap, verbose=False)
+    
+    return psds, freqs
+
+# ARCHIVED: Distribution of cluster sizes
+def expected_ec_2d(z, resel_count):
+     # From Worsley 1992...     
+     # See https://matthew-brett.github.io/teaching/random_fields.html
+     z = np.asarray(z)
+     return (resel_count * (4 * np.log(2)) * ((2*np.pi)**(-3./2)) * z) * np.exp((z ** 2)*(-0.5))
+
+#################################################################################################################################################
+# Main Script
+#################################################################################################################################################
+
+#%%
+#################################################################################################################################################
+# Multitaper analysis
+#################################################################################################################################################
+
+# Steps:
+# 1. Load processed/epoched timeseries
+# 2. Generate multitaper PSDs
+# 3. Baseline PSDs
+# 4. Average PSD across trials and subtract the events of interest
+# 5. Average across timepoints and tasks within a subject
+# 6. Plot PSDs and identify statistically significant differences between Nogo Correct and Nogo Incorrect trials
+# 7. Separately do step 5 for 1.5-second "pre-stimulus" and "post-stimulus" time windows
+
+multitaper_psds = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+multitaper_psds_averaged = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+multitaper_psds_difference = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+channels_of_interest = {subj: other_channels[subj] + [vs_channel_labels[subj]] for subj in other_channels}
+
+if (not os.path.exists(os.path.join(analysis_dir, 'multitaper_psds.pkl')) and not os.path.exists(os.path.join(analysis_dir, 'multitaper_psds_averaged.pkl')) and not os.path.exists(os.path.join(analysis_dir, 'multitaper_psds_difference.pkl'))) or rerun_multitaper_analysis:
+    for subj in subjects:
+        print(f'\nProcessing {subj}')
+        subj_multitaper_psds = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        subj_multitaper_psds_averaged = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        subj_multitaper_psds_difference = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        for timepoint in subjects[subj]:
+            for task in subjects[subj][timepoint]:
+                # Step 1: Load processed/epoched timeseries
+                timeseries_fname = os.path.join(processed_dir, subj, timepoint, task, f'data_{montage}', f'{subj}_{timepoint}_{task}_timeseries.h5')
+                with h5py.File(timeseries_fname, 'r') as f:
+                    ## Load data
+                    subj_timeseries = {key: f[key][:] for key in f.keys() if key in interested_events}
+                    channel_labels = [label.decode() for label in f['Channel Names'][:]]
+                
+                ## And isolate to just channels of interest
+                channels_of_interest_idxs = {channel: channel_labels.index(channel) for channel in channels_of_interest[subj]}
+                subj_timeseries = {key: subj_timeseries[key][:, list(channels_of_interest_idxs.values()), :] for key in subj_timeseries}
+                
+                # ## And isolate to just VS channel
+                # vs_channel_idx = channel_labels.index(vs_channel_labels[subj])
+                # subj_timeseries = {key: np.expand_dims(subj_timeseries[key][:, vs_channel_idx, :], axis=1) for key in subj_timeseries}
+                
+                # Step 2: Generate multitaper PSDs
+                for ch in range(subj_timeseries[interested_events[0]].shape[1]):
+                    subj_multitaper_psds[timepoint][task][channels_of_interest[subj][ch]] = {event: multitaper_analysis(np.expand_dims(subj_timeseries[event][:, ch, :], axis=1), Fs, n_freqs=98, min_freq=2, max_freq=100, n_jobs=10) for event in subj_timeseries}
+                subj_multitaper_psds[timepoint][task] = {ch: {event: np.squeeze(subj_multitaper_psds[timepoint][task][ch][event], axis=1) for event in subj_multitaper_psds[timepoint][task][ch]} for ch in subj_multitaper_psds[timepoint][task]}
+                
+                # # Step 2: Generate multitaper PSDs
+                # subj_multitaper_psds[timepoint][task] = {event: multitaper_analysis(subj_timeseries[event], Fs, n_freqs=98, min_freq=2, max_freq=100, n_jobs=10) for event in subj_timeseries}
+                # ## Squeeze out the extra dimension
+                # subj_multitaper_psds[timepoint][task] = {event: np.squeeze(subj_multitaper_psds[timepoint][task][event], axis=1) for event in subj_multitaper_psds[timepoint][task]}
+                # # orig_multitapers = subj_multitaper_psds.copy() # Save original multitapers for later
+                
+                # Step 3: Baseline PSDs
+                subj_multitaper_psds[timepoint][task] = {ch: {event: custom_baseline(subj_multitaper_psds[timepoint][task][ch][event], baseline_period, baseline_method) for event in subj_multitaper_psds[timepoint][task][ch]} for ch in subj_multitaper_psds[timepoint][task]}
+                
+                # # Step 3: Baseline PSDs
+                # subj_multitaper_psds[timepoint][task] = {event: custom_baseline(subj_multitaper_psds[timepoint][task][event], baseline_period, baseline_method) for event in subj_multitaper_psds[timepoint][task]}
+                # # Squeeze out the extra dimension
+                # # subj_multitaper_psds[timepoint][task] = {event: np.squeeze(subj_multitaper_psds[timepoint][task][event], axis=1) for event in subj_multitaper_psds[timepoint][task]}
+                
+                # Step 4: Average PSD across trials and subtract the events of interest
+                ## Average across trials
+                subj_multitaper_psds_averaged[timepoint][task] = {ch: {event: np.mean(subj_multitaper_psds[timepoint][task][ch][event], axis=0) for event in subj_multitaper_psds[timepoint][task][ch]} for ch in subj_multitaper_psds[timepoint][task]}
+                ## Subtract Nogo Incorrect from Nogo Correct
+                subj_multitaper_psds_difference[timepoint][task] = {ch: subj_multitaper_psds_averaged[timepoint][task][ch][interested_events[1]] - subj_multitaper_psds_averaged[timepoint][task][ch][interested_events[0]] for ch in subj_multitaper_psds_averaged[timepoint][task]}
+                
+                
+                # # Step 4: Average across trials and subtract the events of interest
+                # ## Average across trials
+                # subj_multitaper_psds_averaged[timepoint][task] = {event: np.mean(subj_multitaper_psds[timepoint][task][event], axis=0) for event in subj_multitaper_psds[timepoint][task]}
+                # ## Subtract Nogo Incorrect from Nogo Correct
+                # subj_multitaper_psds_difference[timepoint][task] = subj_multitaper_psds_averaged[timepoint][task][interested_events[1]] - subj_multitaper_psds_averaged[timepoint][task][interested_events[0]]
+        # Add to main dictionary
+        # multitaper_psds[subj] = subj_multitaper_psds
+        multitaper_psds_averaged[subj] = subj_multitaper_psds_averaged
+        multitaper_psds_difference[subj] = subj_multitaper_psds_difference
+        # Save PSDs to file
+        print(f'\nSaving {subj} multitaper PSDs to file...')
+        pickle.dump(subj_multitaper_psds, open(os.path.join(cache_dir, f'{subj}_{timepoint}_{task}_multitaper_psds.pkl'), 'wb'))
+    # Save multitaper PSDs
+    print('\nSaving group average/difference multitaper PSDs to file...')
+    # pickle.dump(multitaper_psds, open(os.path.join(analysis_dir, 'multitaper_psds.pkl'), 'wb'))
+    pickle.dump(multitaper_psds_averaged, open(os.path.join(analysis_dir, 'multitaper_psds_averaged.pkl'), 'wb'))
+    pickle.dump(multitaper_psds_difference, open(os.path.join(analysis_dir, 'multitaper_psds_difference.pkl'), 'wb'))
+else:
+    print('\nLoading previously generated multitaper PSDs from file...')
+    # multitaper_psds = pickle.load(open(os.path.join(analysis_dir, 'multitaper_psds.pkl'), 'rb'))
+    multitaper_psds_averaged = pickle.load(open(os.path.join(analysis_dir, 'multitaper_psds_averaged.pkl'), 'rb'))
+    multitaper_psds_difference = pickle.load(open(os.path.join(analysis_dir, 'multitaper_psds_difference.pkl'), 'rb'))
+
+#%%
+#################################################################################################################################################
+# Let's analyze only the VS channel
+# With cluster-based testing
+
+# Steps:
+# 1. Generate a 3-dimensional t-statistic array of shape (n_subjects, n_frequencies, n_timepoints) using the "difference" multitaper PSD arrays
+# 2. Threshold this map using a particular t-stat
+# 3. Perform cluster correction
+
+# Step 1:
+## First, let's combine all subjects' data into a single 3-dimensional array
+vs_multitaper_array = np.stack([multitaper_psds_difference[subj][timepoint][task][vs_channel_labels[subj]] for subj in multitaper_psds_difference for timepoint in multitaper_psds_difference[subj] for task in multitaper_psds_difference[subj][timepoint]])
+## If you want to consider only first trial for each patient:
+# vs_multitaper_array = np.stack([multitaper_psds_difference[subj][timepoint][task][vs_channel_labels[subj]] for subj in multitaper_psds_difference for timepoint in [list(multitaper_psds_difference[subj].keys())[0]] for task in multitaper_psds_difference[subj][timepoint]])
+
+## Smooth the input array
+# vs_multitaper_array = ndimage.gaussian_filter(vs_multitaper_array, sigma=1)
+## Then we'll calculate t-statistics for every pixel based on a one-sample t-test (null hypothesis is that the mean is 0)
+t_statistic_array, p_value_array = stats.ttest_1samp(vs_multitaper_array, 0, axis=0)
+## Smooth the t-statistic array
+t_statistic_array = ndimage.gaussian_filter(t_statistic_array, sigma=2)
+
+## Plot t-statistic array
+max_abs_val = np.max(np.abs(t_statistic_array))
+plt.imshow(t_statistic_array, aspect='auto', cmap='RdBu_r', 
+           vmin=-max_abs_val, vmax=max_abs_val)  # Set color limits symmetrically
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100]) # 97 = 100 to fit the red line below without creating a weird space above the graph
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+plt.show()
+
+# Cluster-correction
+tstat_threshold = 2.3 # Threshold for t-statistic
+
+## Get size of clusters greater than threshold
+binary_map = t_statistic_array > tstat_threshold
+labeled_map, num_features = ndimage.label(binary_map)
+cluster_sizes = ndimage.sum(binary_map, labeled_map, range(num_features + 1))
+
+## Using monte-carlo simulations, get the distribution of cluster sizes with t-statistics > 2.3 (p < 0.05)
+N = 1000 # Number of permutations
+cluster_distribution = []
+for iter in tqdm(range(N)):
+    tmp_multitaper_array = np.array([np.random.permutation(multitaper_psds_difference[subj][timepoint][task][vs_channel_labels[subj]]) for subj in multitaper_psds_difference for timepoint in multitaper_psds_difference[subj] for task in multitaper_psds_difference[subj][timepoint]])
+    tmp_t_statistic_array, tmp_p_value_array = stats.ttest_1samp(tmp_multitaper_array, 0, axis=0)
+    # Get the cluster sizes
+    tmp_binary_map = tmp_t_statistic_array > 2.3
+    tmp_labelled_map, tmp_num_features = ndimage.label(tmp_binary_map)
+    cluster_distribution.append(np.max(ndimage.sum(tmp_binary_map, tmp_labelled_map, range(tmp_num_features + 1))))
+cluster_threshold = np.percentile(cluster_distribution, 95)
+
+## Identify which clusters out of those defined above are significant
+significant_clusters = np.where(cluster_sizes > cluster_threshold)[0]
+# Plot the significant clusters
+plotting_aray = np.zeros_like(labeled_map)
+for cluster in significant_clusters:
+    plotting_aray[labeled_map == cluster] = t_statistic_array[labeled_map == cluster]
+max_abs_val = np.max(np.abs(plotting_aray))
+plt.imshow(plotting_aray, aspect='auto', cmap='RdBu_r', vmin=-max_abs_val, vmax=max_abs_val)
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100]) # 97 = 100 to fit the red line below without creating a weird space above the graph
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+plt.show()
+
+## As a check, let's plot a histogram of values in the significant cluster between Nogo Correct and Nogo Incorrect trials
+avg_vs_multitaper_array = np.stack(multitaper_psds_averaged[subj][timepoint][task][vs_channel_labels[subj]] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint])
+cluster_values = avg_vs_multitaper_array[labeled_map == significant_clusters[0]]
+
+### Experimental Plot
+### Overlay significant clusters on top of the PSDs
+### First, let's plot the PSDs
+## Plot t-statistic array
+max_abs_val = np.max(np.abs(t_statistic_array))
+plt.imshow(t_statistic_array, aspect='auto', cmap='RdBu_r', 
+           vmin=-max_abs_val, vmax=max_abs_val)
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100])
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+outlines_array = np.zeros_like(t_statistic_array)
+for cluster in significant_clusters:
+    # Create a binary mask for the current cluster
+    cluster_mask = (labeled_map == cluster)
+    # Erode the binary mask to get the interior
+    eroded_mask = binary_erosion(cluster_mask)
+    # Subtract the eroded mask from the original mask to get the outline
+    outline = cluster_mask & ~eroded_mask
+    # Apply the outline to the plotting array
+    outlines_array[outline] = t_statistic_array[outline]
+# Overlay outlines on the main PSD plot
+# Use a contrasting color and adjust linewidth if necessary
+plt.contour(outlines_array != 0, colors='yellow', linewidths=0.5)
+plt.show()
+
+# Record the coordinates of significant VS clusters
+vs_sig_timepoints = [x[1] for x in np.argwhere(plotting_aray != 0)]
+vs_sig_frequencies = [x[0] for x in np.argwhere(plotting_aray != 0)]
+
+# Next, let's plot power vs. frequency in the timewindow of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+multitaper_nogocorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task][vs_channel_labels[subj]]['Nogo Correct'] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+multitaper_nogoincorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task][vs_channel_labels[subj]]['Nogo Incorrect'] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+
+### Average the PSD estimates over the sig_timepoints time window
+power_vs_freq_nogocorrect = np.mean(multitaper_nogocorrect_array[:, :, vs_sig_timepoints], axis=2)
+power_vs_freq_nogoincorrect = np.mean(multitaper_nogoincorrect_array[:, :, vs_sig_timepoints], axis=2)
+multitaper_freqs = np.linspace(2, 100, 98)
+power_vs_freq_df = pd.concat((pd.DataFrame(power_vs_freq_nogocorrect, columns=multitaper_freqs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_freq_nogoincorrect, columns=multitaper_freqs).assign(response='Nogo Incorrect')))
+
+### Plot
+power_vs_freq_df_melted = power_vs_freq_df.melt(id_vars='response', var_name='freq', value_name='power')
+sns.lineplot(data=power_vs_freq_df_melted, x='freq', y='power', hue='response', errorbar='se', palette=custom_palette)
+plt.xscale('log')
+plt.xticks([2, 5, 10, 20, 50, 100], [2, 5, 10, 20, 50, 100])
+# Add significance horizontal bars in the range of sig_frequencies
+min_freq = max(np.min(vs_sig_frequencies), 2)
+max_freq = np.max(vs_sig_frequencies)
+plt.hlines(y=-1, xmin=min_freq, xmax=max_freq, color='k', linestyle='-')
+# Add an asterisk above the horizontal bar
+plt.text(x=np.mean((min_freq, max_freq)), y=-0.9, s='*', fontsize=20, horizontalalignment='center')
+plt.legend(title=None)
+sns.despine()
+plt.show()
+
+# And then, let's plot power vs. time in the frequency window of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+### Average the PSD estimates over the sig_frequencies frequency, within the post-stimulus time-window
+min_time = int(2*Fs)
+max_time = int(3.5*Fs)
+time_window = np.arange(min_time, max_time)
+power_vs_time_nogocorrect = multitaper_nogocorrect_array[:, :, time_window]
+power_vs_time_nogoincorrect = multitaper_nogoincorrect_array[:, :, time_window]
+power_vs_time_nogocorrect = np.mean(power_vs_time_nogocorrect[:, vs_sig_frequencies, :], axis=1)
+power_vs_time_nogoincorrect = np.mean(power_vs_time_nogoincorrect[:, vs_sig_frequencies, :], axis=1)
+power_vs_time_df = pd.concat((pd.DataFrame(power_vs_time_nogocorrect, columns=time_window/Fs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_time_nogoincorrect, columns=time_window/Fs).assign(response='Nogo Incorrect')))
+
+### Plot
+power_vs_time_df_melted = power_vs_time_df.melt(id_vars='response', var_name='time', value_name='power')
+sns.lineplot(data=power_vs_time_df_melted, x='time', y='power', hue='response', errorbar='se', palette=custom_palette)
+plt.legend(title=None)
+# Add significance horizontal bars in the range of sig_timepoints
+sig_timepoints_seconds = [x/Fs for x in vs_sig_timepoints]
+min_time = np.min(sig_timepoints_seconds)
+max_time = np.max(sig_timepoints_seconds)
+plt.hlines(y=-1, xmin=min_time, xmax=max_time, color='k', linestyle='-')
+# Add an asterisk above the horizontal bar
+plt.text(x=np.mean((min_time, max_time)), y=-0.9, s='*', fontsize=20, horizontalalignment='center')
+sns.despine()
+plt.show()
+
+
+#%%
+#################################################################################################################################################
+# Repeat the above but for other channels of interest
+
+roi = 'anteriorinsula'
+
+if roi == 'hippocampus':
+    roi_channel_labels = {'SEEG-SK-54': 'HP1-HP2',
+                          'SEEG-SK-55': 'HP1-HP2',
+                          'SEEG-SK-62': 'HP1-HP2',
+                          'SEEG-SK-63': 'HP1-HP2'}
+elif roi == 'amygdala':
+    roi_channel_labels = {'SEEG-SK-54': 'AM1-AM2',
+                          'SEEG-SK-55': 'AM1-AM2',
+                          'SEEG-SK-62': 'AM1-AM2',
+                          'SEEG-SK-63': 'AM1-AM2'}
+elif roi == 'thalamus':
+    roi_channel_labels = {'SEEG-SK-54': 'STT1-STT2',
+                          'SEEG-SK-62': 'CMN1-CMN2'}
+    # roi_channel_labels = {'SEEG-SK-54': 'STT1-STT2',
+    #                       'SEEG-SK-55': 'PT1-PT2',
+    #                       'SEEG-SK-62': 'CMN1-CMN2',
+    #                       'SEEG-SK-63': 'ANT1-ANT2'}
+elif roi == 'ofc':
+    roi_channel_labels = {'SEEG-SK-53': 'FOFC1-FOFC2',
+                          'SEEG-SK-63': 'OF1-OF2'}
+elif roi == 'anteriorinsula':
+    roi_channel_labels = {'SEEG-SK-53': 'MLAI1-MLAI2',
+                          'SEEG-SK-54': 'FMAI1-FMAI2',
+                          'SEEG-SK-55': 'AI1-AI2',
+                          'SEEG-SK-62': 'AI1-AI2',
+                          'SEEG-SK-63': 'AI1-AI2'}
+elif roi == 'anteriorcingulate':
+    roi_channel_labels = {'SEEG-SK-53': 'PTAC1-PTAC2',
+                          'SEEG-SK-54': 'PTC1-PTC2',
+                          'SEEG-SK-55': 'AC1-AC2',
+                          'SEEG-SK-63': 'AC1-AC2'}
+                          
+# hp_multitaper_array = np.stack([multitaper_psds_difference[subj][timepoint][task][roi_channel_labels[subj]] for subj in roi_channel_labels for timepoint in multitaper_psds_difference[subj] for task in multitaper_psds_difference[subj][timepoint]])
+# If you want to consider only first trial for each patient:
+hp_multitaper_array = np.stack([multitaper_psds_difference[subj][timepoint][task][roi_channel_labels[subj]] for subj in roi_channel_labels for timepoint in [list(multitaper_psds_difference[subj].keys())[0]] for task in multitaper_psds_difference[subj][timepoint]])
+
+t_statistic_array, p_value_array = stats.ttest_1samp(hp_multitaper_array, 0, axis=0)
+t_statistic_array = ndimage.gaussian_filter(t_statistic_array, sigma=2)
+
+## Plot t-statistic array
+max_abs_val = np.max(np.abs(t_statistic_array))
+plt.imshow(t_statistic_array, aspect='auto', cmap='RdBu_r', 
+           vmin=-max_abs_val, vmax=max_abs_val)  # Set color limits symmetrically
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100]) # 97 = 100 to fit the red line below without creating a weird space above the graph
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+plt.show()
+
+# Cluster-correction
+tstat_threshold = 2.3 # Threshold for t-statistic
+
+## Get size of clusters greater than threshold
+binary_map = t_statistic_array > tstat_threshold
+labeled_map, num_features = ndimage.label(binary_map)
+cluster_sizes = ndimage.sum(binary_map, labeled_map, range(num_features + 1))
+
+## Using monte-carlo simulations, get the distribution of cluster sizes with t-statistics > 2.3 (p < 0.05)
+N = 500 # Number of permutations
+cluster_distribution = []
+for iter in tqdm(range(N)):
+    tmp_multitaper_array = np.array([np.random.permutation(multitaper_psds_difference[subj][timepoint][task][roi_channel_labels[subj]]) for subj in roi_channel_labels for timepoint in multitaper_psds_difference[subj] for task in multitaper_psds_difference[subj][timepoint]])
+    tmp_t_statistic_array, tmp_p_value_array = stats.ttest_1samp(tmp_multitaper_array, 0, axis=0)
+    # Get the cluster sizes
+    tmp_binary_map = tmp_t_statistic_array > 2.3
+    tmp_labelled_map, tmp_num_features = ndimage.label(tmp_binary_map)
+    cluster_distribution.append(np.max(ndimage.sum(tmp_binary_map, tmp_labelled_map, range(tmp_num_features + 1))))
+cluster_threshold = np.percentile(cluster_distribution, 99)
+
+## Identify which clusters out of those defined above are significant
+significant_clusters = np.where(cluster_sizes > cluster_threshold)[0]
+# Plot the significant clusters
+plotting_aray = np.zeros_like(labeled_map)
+for cluster in significant_clusters:
+    plotting_aray[labeled_map == cluster] = t_statistic_array[labeled_map == cluster]
+max_abs_val = np.max(np.abs(plotting_aray))
+plt.imshow(plotting_aray, aspect='auto', cmap='RdBu_r', vmin=-max_abs_val, vmax=max_abs_val)
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100]) # 97 = 100 to fit the red line below without creating a weird space above the graph
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+plt.show()
+
+### Experimental Plot
+### Overlay significant clusters on top of the PSDs
+### First, let's plot the PSDs
+## Plot t-statistic array
+max_abs_val = np.max(np.abs(t_statistic_array))
+plt.imshow(t_statistic_array, aspect='auto', cmap='RdBu_r', 
+           vmin=-max_abs_val, vmax=max_abs_val)
+plt.gca().invert_yaxis()
+cbar = plt.colorbar()
+cbar.set_label('T-Statistic Value')
+plt.xticks([0, 2048, 4096, 6144, 8192], [-2, -1, 0, 1, 2])
+plt.yticks([0, 18, 38, 58, 78, 97.4], [2, 20, 40, 60, 80, 100])
+plt.vlines(x=4096, ymin=0, ymax=97.4, color='darkred', linestyle='--')
+outlines_array = np.zeros_like(t_statistic_array)
+for cluster in significant_clusters:
+    # Create a binary mask for the current cluster
+    cluster_mask = (labeled_map == cluster)
+    # Erode the binary mask to get the interior
+    eroded_mask = binary_erosion(cluster_mask)
+    # Subtract the eroded mask from the original mask to get the outline
+    outline = cluster_mask & ~eroded_mask
+    # Apply the outline to the plotting array
+    outlines_array[outline] = t_statistic_array[outline]
+# Overlay outlines on the main PSD plot
+# Use a contrasting color and adjust linewidth if necessary
+plt.contour(outlines_array != 0, colors='yellow', linewidths=0.5)
+plt.show()
+
+# Next, let's plot power vs. frequency in the timewindow of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+multitaper_nogocorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task][roi_channel_labels[subj]]['Nogo Correct'] for subj in roi_channel_labels for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+multitaper_nogoincorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task][roi_channel_labels[subj]]['Nogo Incorrect'] for subj in roi_channel_labels for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+
+# ### Get the coordinates of the significant clusters
+sig_timepoints = [x[1] for x in np.argwhere(plotting_aray != 0)]
+sig_frequencies = [x[0] for x in np.argwhere(plotting_aray != 0)]
+sig_frequencies = np.unique(sig_frequencies)
+
+# # As a check, let's plot a histogram of values in the significant cluster between Nogo Correct and Nogo Incorrect trials
+# avg_multitaper_array = np.stack(multitaper_psds_averaged[subj][timepoint][task][roi_channel_labels[subj]] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint])
+# cluster_values = avg_multitaper_array[labeled_map == significant_clusters[0]]
+
+
+# If there are multiple significant clusters, only use the one cloest to the stimulus appearance
+if max(np.diff(sig_timepoints)) > 1: # Check if there are any gaps in the significant timepoints
+    gaps = np.where(np.diff(sig_timepoints) > 1)[0]+1
+    sig_timepoint_ranges = np.split(sig_timepoints, gaps)
+    sig_timepoints = sig_timepoint_ranges[0] # Only use the lowest significant time range for now
+
+### Average the PSD estimates over the sig_timepoints time window
+power_vs_freq_nogocorrect = np.mean(multitaper_nogocorrect_array[:, :, sig_timepoints], axis=2)
+power_vs_freq_nogoincorrect = np.mean(multitaper_nogoincorrect_array[:, :, sig_timepoints], axis=2)
+multitaper_freqs = np.linspace(2, 100, 98)
+power_vs_freq_df = pd.concat((pd.DataFrame(power_vs_freq_nogocorrect, columns=multitaper_freqs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_freq_nogoincorrect, columns=multitaper_freqs).assign(response='Nogo Incorrect')))
+
+### Plot
+ylim_min = np.percentile(power_vs_freq_df_melted['power'], 5) - 0.5
+power_vs_freq_df_melted = power_vs_freq_df.melt(id_vars='response', var_name='freq', value_name='power')
+sns.lineplot(data=power_vs_freq_df_melted, x='freq', y='power', hue='response', errorbar='se', palette=custom_palette)
+plt.xscale('log')
+plt.xticks([2, 5, 10, 20, 50, 100], [2, 5, 10, 20, 50, 100])
+# Add significance horizontal bars in the range of sig_frequencies
+# Separate significant frequencies into multiple non-contiguous ranges if needed
+if max(np.diff(sig_frequencies)) > 1: # Check if there are any gaps in the significant frequencies
+    gaps = np.where(np.diff(sig_frequencies) > 1)[0]+1
+    sig_freq_ranges = np.split(sig_frequencies, gaps)
+    for sig_freq_range in sig_freq_ranges:
+        min_freq = max(np.min(sig_freq_range), 2)
+        max_freq = np.max(sig_freq_range)
+        plt.hlines(y=ylim_min, xmin=min_freq, xmax=max_freq, color='k', linestyle='-')
+        # Add an asterisk above the horizontal bar
+        plt.text(x=np.mean((min_freq, max_freq)), y=ylim_min, s='*', fontsize=20, horizontalalignment='center')
+else:
+    min_freq = max(np.min(sig_frequencies), 2)
+    max_freq = np.max(sig_frequencies)
+    plt.hlines(y=ylim_min, xmin=min_freq, xmax=max_freq, color='k', linestyle='-')
+    # Add an asterisk above the horizontal bar
+    plt.text(x=np.mean((min_freq, max_freq)), y=ylim_min, s='*', fontsize=20, horizontalalignment='center')
+plt.legend(title=None)
+sns.despine()
+plt.show()
+
+# And then, let's plot power vs. time in the frequency window of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+### Average the PSD estimates over the LOWEST of the sig_frequencies frequency, within the post-stimulus time-window
+min_time = int(2*Fs)
+max_time = int(3.5*Fs)
+time_window = np.arange(min_time, max_time)
+power_vs_time_nogocorrect = multitaper_nogocorrect_array[:, :, time_window]
+power_vs_time_nogoincorrect = multitaper_nogoincorrect_array[:, :, time_window]
+if max(np.diff(sig_frequencies)) > 1: # Check if there are any gaps in the significant frequencies
+    gaps = np.where(np.diff(sig_frequencies) > 1)[0]+1
+    sig_freq_ranges = np.split(sig_frequencies, gaps)
+    sig_frequencies = sig_freq_ranges[0] # Only use the lowest significant frequency range for now
+power_vs_time_nogocorrect = np.mean(power_vs_time_nogocorrect[:, sig_frequencies, :], axis=1)
+power_vs_time_nogoincorrect = np.mean(power_vs_time_nogoincorrect[:, sig_frequencies, :], axis=1)
+power_vs_time_df = pd.concat((pd.DataFrame(power_vs_time_nogocorrect, columns=time_window/Fs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_time_nogoincorrect, columns=time_window/Fs).assign(response='Nogo Incorrect')))
+
+### Plot
+ylim_min = np.percentile(power_vs_freq_df_melted['power'], 5) - 0.5
+power_vs_time_df_melted = power_vs_time_df.melt(id_vars='response', var_name='time', value_name='power')
+sns.lineplot(data=power_vs_time_df_melted, x='time', y='power', hue='response', errorbar='se', palette=custom_palette)
+plt.legend(title=None)
+# Add significance horizontal bars in the range of sig_timepoints
+sig_timepoints_seconds = [x/Fs for x in sig_timepoints]
+min_time = max(np.min(sig_timepoints_seconds), 2)
+max_time = np.max(sig_timepoints_seconds)
+plt.hlines(y=ylim_min, xmin=min_time, xmax=max_time, color='k', linestyle='-')
+# Add an asterisk above the horizontal bar
+plt.text(x=np.mean((min_time, max_time)), y=ylim_min, s='*', fontsize=20, horizontalalignment='center')
+sns.despine()
+plt.show()
+
+
+#%%
+#################################################################################################################################################
+# Connectivity analyses
+#################################################################################################################################################
+
+# Steps:
+# 1. Load processed/epoched timeseries
+# 2. Include only the channels of interest
+# 3. Filter the timeseries to the frequency range of interest
+# 4. Calculate the connectivity measure of interest
+
+region = 'anteriorcingulate'
+
+# User-defined variables
+## Not all subjects will have all channels of interest
+## The below dict is in the format {subject: [channel to compare to (e.g. ventral striatum), channel of interest 1, ...]}
+if region == 'anteriorcingulate':
+    connectivity_subjects = {'SEEG-SK-53': ['LLVS1-LLVS2', 'PTAC1-PTAC2'],
+                            'SEEG-SK-54': ['FVT1-FVT2', 'PTC1-PTC2'],
+                            'SEEG-SK-55': ['STR1-STR2', 'AC1-AC2'],
+                            'SEEG-SK-63': ['VS1-VS2', 'AC1-AC2']}
+elif region == 'thalamus':
+    connectivity_subjects = {'SEEG-SK-54': ['FVT1-FVT2', 'STT1-STT2'],
+                             'SEEG-SK-62': ['VS1-VS2', 'CMN1-CMN2']}
+
+frequencies_of_interest = [2,7]
+connectivity_measure = 'wpli' # 'pli', 'wpli', 'dpli
+time_window = [2, 3.5] # in seconds
+
+connectivity_df = pd.DataFrame()
+for subj in connectivity_subjects:
+    print(f'\nLoading data for {subj}')
+    channels_of_interest = connectivity_subjects
+    # for timepoint in subjects[subj]:
+    for timepoint in [list(subjects[subj].keys())[0]]:
+        for task in subjects[subj][timepoint]:
+            # Step 1: Load processed/epoched timeseries
+            timeseries_fname = os.path.join(processed_dir, subj, timepoint, task, f'data_{montage}', f'{subj}_{timepoint}_{task}_timeseries.h5')
+            with h5py.File(timeseries_fname, 'r') as f:
+                ## Load data
+                subj_timeseries = {key: f[key][:] for key in f.keys() if key in interested_events}
+                channel_labels = [label.decode() for label in f['Channel Names'][:]]
+            # Step 2: And isolate to just channels of interest
+            channels_of_interest_idxs = {channel: channel_labels.index(channel) for channel in channels_of_interest[subj]}
+            subj_timeseries = {key: subj_timeseries[key][:, list(channels_of_interest_idxs.values()), :] for key in subj_timeseries}
+            
+            # Step 3: Filter the timeseries to the frequency range of interest
+            sos = butter(4, frequencies_of_interest, 'band', fs=Fs, output='sos')
+            subj_timeseries_filtered = {key: np.zeros_like(subj_timeseries[key]) for key in subj_timeseries}
+            for event in subj_timeseries:
+                for trial in range(subj_timeseries[event].shape[0]):
+                    for channel in range(subj_timeseries[event].shape[1]):
+                        subj_timeseries_filtered[event][trial, channel, :] = sosfiltfilt(sos, subj_timeseries[event][trial, channel, :])
+            
+            # Step 4: Calculate the connectivity measure of interest
+            if connectivity_measure == 'pli' or connectivity_measure == 'wpli' or connectivity_measure == 'dpli':
+                ## Calculate the phase lag index
+                ## Substeps:
+                ### Substep 1: Calculate the analytic signal
+                ### Substep 2: Calculate the phase of the analytic signal
+                ### Substep 3: Include only the specified time window
+                ### Substep 4: Calculate phase differences between the channels of interest
+                ### Substep 5: Calculate the phase lag index
+                
+                subj_phase_angles = {key: np.zeros((subj_timeseries_filtered[key].shape[0], subj_timeseries_filtered[key].shape[1], int(time_window[1]*Fs - time_window[0]*Fs))) for key in subj_timeseries_filtered}
+                subj_pli = {key: np.zeros((subj_timeseries_filtered[key].shape[0])) for key in subj_timeseries_filtered}
+                for event in subj_timeseries_filtered:
+                    ### Substep 1: Calculate the anayltic signal and phase of filtered timeseries for each channel
+                    for trial in range(subj_timeseries_filtered[event].shape[0]):
+                        ### Substep 2: Calculate the phase of the analytic signal for each channel
+                        trial_phase_angles = {ch: np.angle(hilbert(subj_timeseries_filtered[event][trial, ch, :])) for ch in range(subj_timeseries_filtered[event].shape[1])}
+                        ### Substep 3: Include only the specified time window
+                        for ch in trial_phase_angles:
+                            trial_phase_angles[ch] = trial_phase_angles[ch][int(time_window[0]*Fs):int(time_window[1]*Fs)]
+                        ### Substep 4: Calculate difference in phase between the channels of interest
+                        trial_phase_diff = trial_phase_angles[0] - trial_phase_angles[1]
+                        ### Substep 5: Calculate the phase lag index
+                        if connectivity_measure == 'pli':
+                            trial_pli = np.abs(np.mean(np.sign(np.sin(trial_phase_diff))))
+                        elif connectivity_measure == 'wpli': # Weighted phase lag index
+                            trial_pli = np.abs(np.mean(np.sign(trial_phase_diff) * np.sin(trial_phase_diff)))
+                        elif connectivity_measure == 'dpli':
+                            trial_pli = np.mean(trial_phase_diff > 0) - np.mean(trial_phase_diff < 0)
+                        subj_phase_angles[event][trial, :, :] = np.array([trial_phase_angles[ch] for ch in trial_phase_angles])
+                        subj_pli[event][trial] = trial_pli
+                subj_pli_df = pd.concat((pd.DataFrame(subj_pli['Nogo Correct'], columns=['PLI']).assign(response='Nogo Correct'), pd.DataFrame(subj_pli['Nogo Incorrect'], columns=['PLI']).assign(response='Nogo Incorrect')))
+                subj_pli_df = subj_pli_df.assign(subject=subj, timepoint=timepoint, task=task)
+                connectivity_df = pd.concat((connectivity_df, subj_pli_df))
+                # sns.stripplot(data=subj_pli_df, x='response', y='PLI', palette=custom_palette)
+                # plt.show()
+
+# Plot the connectivity measure
+for subj in connectivity_df['subject'].unique():
+    sns.stripplot(data=connectivity_df[connectivity_df['subject'] == subj], x='response', y='PLI', hue='timepoint', palette='Set2', dodge=True)
+    plt.title(f'{connectivity_measure} for {subj}')
+    plt.show()
+
+sns.stripplot(data=connectivity_df, x='subject', y='PLI', hue='response', palette=custom_palette, dodge=True)
+plt.title(f'{connectivity_measure}')
+plt.legend(title=None, bbox_to_anchor=(1.05, 1), loc='upper left')
+sns.despine()
+plt.show()
+
+# Print the mean and standard deviation of the connectivity measure
+print(connectivity_df.groupby(['subject', 'response']).agg({'PLI': ['mean', 'std']}))
+
+# Linear mixed effects model comparing the connectivity measure between Nogo Correct and Nogo Incorrect trials
+if len(connectivity_df['subject'].unique())>1:
+    model = Lmer('PLI ~ response + (1|subject)', data=connectivity_df.reset_index(drop=True))
+    print(model.fit())
+else:
+    print(stats.ttest_ind(connectivity_df[connectivity_df['response'] == 'Nogo Correct']['PLI'], connectivity_df[connectivity_df['response'] == 'Nogo Incorrect']['PLI']))
+
+# # Plot the timeseries
+# for event in subj_timeseries_filtered:
+#     plt.plot(subj_timeseries_filtered[event][0, 0, :])
+#     plt.plot(subj_timeseries_filtered[event][0, 1, :])
+#     plt.title(f'Filtered timeseries for {event}')
+#     # Label the colours with channel names
+#     plt.legend([channels_of_interest[subj][0], channels_of_interest[subj][1]])
+#     plt.show()
+
+
+#%%
+# Next, let's plot power vs. frequency in the timewindow of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+# multitaper_nogocorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task]['Nogo Correct'] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+# multitaper_nogoincorrect_array = np.stack([multitaper_psds_averaged[subj][timepoint][task]['Nogo Incorrect'] for subj in multitaper_psds_averaged for timepoint in multitaper_psds_averaged[subj] for task in multitaper_psds_averaged[subj][timepoint]])
+
+# # ### Get the coordinates of the significant clusters
+# # sig_timepoints = [x[1] for x in np.argwhere(plotting_aray != 0)]
+# # sig_frequencies = [x[0] for x in np.argwhere(plotting_aray != 0)]
+# # sig_frequencies = np.unique(sig_frequencies)
+
+# ### Average the PSD estimates over the sig_timepoints time window
+# power_vs_freq_nogocorrect = np.mean(multitaper_nogocorrect_array[:, :, vs_sig_timepoints], axis=2)
+# power_vs_freq_nogoincorrect = np.mean(multitaper_nogoincorrect_array[:, :, vs_sig_timepoints], axis=2)
+# multitaper_freqs = np.linspace(2, 100, 98)
+# power_vs_freq_df = pd.concat((pd.DataFrame(power_vs_freq_nogocorrect, columns=multitaper_freqs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_freq_nogoincorrect, columns=multitaper_freqs).assign(response='Nogo Incorrect')))
+
+# ### Plot
+# power_vs_freq_df_melted = power_vs_freq_df.melt(id_vars='response', var_name='freq', value_name='power')
+# sns.lineplot(data=power_vs_freq_df_melted, x='freq', y='power', hue='response', errorbar='se', palette=custom_palette)
+# plt.xscale('log')
+# plt.xticks([2, 5, 10, 20, 50, 100], [2, 5, 10, 20, 50, 100])
+# # Add significance horizontal bars in the range of sig_frequencies
+# min_freq = max(np.min(vs_sig_frequencies), 2)
+# max_freq = np.max(vs_sig_frequencies)
+# plt.hlines(y=-1, xmin=min_freq, xmax=max_freq, color='k', linestyle='-')
+# # Add an asterisk above the horizontal bar
+# plt.text(x=np.mean((min_freq, max_freq)), y=-0.9, s='*', fontsize=20, horizontalalignment='center')
+# plt.legend(title=None)
+# sns.despine()
+
+# # And then, let's plot power vs. time in the frequency window of the significant cluster between Nogo Correct and Nogo Incorrect trials
+
+# ### Average the PSD estimates over the sig_frequencies frequency, within the post-stimulus time-window
+# min_time = int(2*Fs)
+# max_time = int(3.5*Fs)
+# time_window = np.arange(min_time, max_time)
+# power_vs_time_nogocorrect = multitaper_nogocorrect_array[:, :, time_window]
+# power_vs_time_nogoincorrect = multitaper_nogoincorrect_array[:, :, time_window]
+# power_vs_time_nogocorrect = np.mean(power_vs_time_nogocorrect[:, vs_sig_frequencies, :], axis=1)
+# power_vs_time_nogoincorrect = np.mean(power_vs_time_nogoincorrect[:, vs_sig_frequencies, :], axis=1)
+# power_vs_time_df = pd.concat((pd.DataFrame(power_vs_time_nogocorrect, columns=time_window/Fs).assign(response='Nogo Correct'), pd.DataFrame(power_vs_time_nogoincorrect, columns=time_window/Fs).assign(response='Nogo Incorrect')))
+
+# ### Plot
+# power_vs_time_df_melted = power_vs_time_df.melt(id_vars='response', var_name='time', value_name='power')
+# sns.lineplot(data=power_vs_time_df_melted, x='time', y='power', hue='response', errorbar='se', palette=custom_palette)
+# plt.legend(title=None)
+# # Add significance horizontal bars in the range of sig_timepoints
+# sig_timepoints_seconds = [x/Fs for x in vs_sig_timepoints]
+# min_time = np.min(sig_timepoints_seconds)
+# max_time = np.max(sig_timepoints_seconds)
+# plt.hlines(y=-1, xmin=min_time, xmax=max_time, color='k', linestyle='-')
+# # Add an asterisk above the horizontal bar
+# plt.text(x=np.mean((min_time, max_time)), y=-0.9, s='*', fontsize=20, horizontalalignment='center')
+# sns.despine()
+
+#%%
+# How does this response change when you stimulate the striatum?
+
+#%%
+#################################################################################################################################################
+# Welch PSD analysis
+#################################################################################################################################################
+
+# Steps:
+# 1. Load processed/epoched timeseries
+# 2. Generate Welch PSDs
+# 3. Baseline PSDs
+# 4. Average PSD across trials and subtract the events of interest
+# 5. Average across timepoints and tasks within a subject
+# 6. Plot PSDs and identify statistically significant differences between Nogo Correct and Nogo Incorrect trials
+
+welch_psds = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+welch_psds_averaged = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+welch_psds_difference = {subj: {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]} for subj in subjects}
+
+if not os.path.exists(os.path.join(analysis_dir, 'welch_psds.pkl')) and not os.path.exists(os.path.join(analysis_dir, 'welch_psds_averaged.pkl')) and not os.path.exists(os.path.join(analysis_dir, 'welch_psds_difference.pkl')):
+    for subj in subjects:
+        print(f'\nProcessing {subj}')
+        subj_welch_psds = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        subj_welch_psds_averaged = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        subj_welch_psds_difference = {timepoint: {task: {}} for timepoint in subjects[subj] for task in subjects[subj][timepoint]}
+        for timepoint in subjects[subj]:
+            for task in subjects[subj][timepoint]:
+                # Step 1: Load processed/epoched timeseries
+                timeseries_fname = os.path.join(processed_dir, subj, timepoint, task, f'data_{montage}', f'{subj}_{timepoint}_{task}_timeseries.h5')
+                with h5py.File(timeseries_fname, 'r') as f:
+                    ## Load data
+                    subj_timeseries = {key: f[key][:] for key in f.keys() if key in interested_events}
+                    channel_labels = [label.decode() for label in f['Channel Names'][:]]
+                ## And isolate to just VS channel
+                vs_channel_idx = channel_labels.index(vs_channel_labels[subj])
+                subj_timeseries = {key: np.expand_dims(subj_timeseries[key][:, vs_channel_idx, :], axis=1) for key in subj_timeseries}
+                
+                # Step 2: Generate Welch PSDs
+                subj_welch_psds[timepoint][task] = {event: calc_welch(subj_timeseries[event], fmin=1, fmax=100)[0] for event in subj_timeseries}
+                _, freqs = calc_welch(subj_timeseries['Nogo Correct'][0], fmin=1, fmax=100) # Needed for baseline correction
+                
+                # Step 3: Baseline PSDs
+                subj_welch_psds[timepoint][task] = {event: welch_baseline(subj_welch_psds[timepoint][task][event], freqs=freqs) for event in subj_welch_psds[timepoint][task]}
+                
+                # Step 4: Average across trials and subtract the events of interest
+                ## Average across trials
+                subj_welch_psds_averaged[timepoint][task] = {event: np.mean(subj_welch_psds[timepoint][task][event], axis=0) for event in subj_welch_psds[timepoint][task]}
+                ## Subtract Nogo Incorrect from Nogo Correct
+                subj_welch_psds_difference[timepoint][task] = subj_welch_psds_averaged[timepoint][task][interested_events[1]] - subj_welch_psds_averaged[timepoint][task][interested_events[0]]
+        # Add to main dictionary
+        welch_psds[subj] = subj_welch_psds
+        welch_psds_averaged[subj] = subj_welch_psds_averaged
+        welch_psds_difference[subj] = subj_welch_psds_difference
+    # # Save multitaper PSDs
+    # print('\nSaving multitaper PSDs to file...')
+    # pickle.dump(welch_psds, open(os.path.join(analysis_dir, 'welch_psds.pkl'), 'wb'))
+    # pickle.dump(welch_psds_averaged, open(os.path.join(analysis_dir, 'welch_psds_averaged.pkl'), 'wb')) 
+    # pickle.dump(welch_psds_difference, open(os.path.join(analysis_dir, 'welch_psds_difference.pkl'), 'wb'))
+    
+#%%
+#################################################################################################################################################
+# Plot and analyze Welch PSDs
+
+welch_diff_array = np.stack([welch_psds_difference[subj][timepoint][task] for subj in welch_psds_difference for timepoint in welch_psds_difference[subj] for task in welch_psds_difference[subj][timepoint]])
+welch_diff_array = np.squeeze(welch_diff_array, axis=1)
+welch_diff_df = pd.DataFrame(welch_diff_array, columns=freqs)
+welch_diff_df = welch_diff_df.reset_index().rename(columns={'index': 'id'})
+
+welch_diff_df_melted = welch_diff_df.melt(id_vars='id', var_name='freq', value_name='power')
+# sns.lineplot(data=welch_diff_df_melted, x='freq', y='power', hue='id', ci=95)
+
+welch_averaged_nogocorrect_array = np.stack([welch_psds_averaged[subj][timepoint][task]['Nogo Correct'] for subj in welch_psds_averaged for timepoint in welch_psds_averaged[subj] for task in welch_psds_averaged[subj][timepoint]])
+welch_averaged_nogoincorrect_array = np.stack([welch_psds_averaged[subj][timepoint][task]['Nogo Incorrect'] for subj in welch_psds_averaged for timepoint in welch_psds_averaged[subj] for task in welch_psds_averaged[subj][timepoint]])
+welch_averaged_nogocorrect_array = np.squeeze(welch_averaged_nogocorrect_array, axis=1)
+welch_averaged_nogoincorrect_array = np.squeeze(welch_averaged_nogoincorrect_array, axis=1)
+welch_averaged_df = pd.concat((pd.DataFrame(welch_averaged_nogocorrect_array, columns=freqs).assign(response='Nogo Correct'), pd.DataFrame(welch_averaged_nogoincorrect_array, columns=freqs).assign(response='Nogo Incorrect')))
+welch_averaged_df = welch_averaged_df.reset_index().rename(columns={'index': 'id'})
+
+welch_averaged_df_melted = welch_averaged_df.melt(id_vars=['id', 'response'], var_name='freq', value_name='power')
+sns.lineplot(data=welch_averaged_df_melted, x='freq', y='power', hue='response', ci=95)
+plt.xlim([0, 20])
